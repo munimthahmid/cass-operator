@@ -45,7 +45,7 @@ func (rc *ReconciliationContext) CalculateRackInfoForDecomm(currentSize int) ([]
 	return decommRackInfo, nil
 }
 
-func (rc *ReconciliationContext) DecommissionNodes(epData httphelper.CassMetadataEndpoints) result.ReconcileResult {
+func (rc *ReconciliationContext) DecommissionNodes(epData httphelper.CassMetadataEndpoints, metadataErr error) result.ReconcileResult {
 	logger := rc.ReqLogger
 	logger.Info("reconcile_racks::DecommissionNodes")
 	dc := rc.Datacenter
@@ -65,6 +65,9 @@ func (rc *ReconciliationContext) DecommissionNodes(epData httphelper.CassMetadat
 
 	if currentSize <= targetSize {
 		return result.Continue()
+	}
+	if metadataErr != nil {
+		return result.Error(fmt.Errorf("cannot decommission a node without Cassandra metadata: %w", metadataErr))
 	}
 
 	decommRackInfo, err := rc.CalculateRackInfoForDecomm(int(currentSize))
@@ -178,7 +181,7 @@ func (rc *ReconciliationContext) callDecommission(pod *corev1.Pod) error {
 }
 
 // Wait for decommissioning nodes to finish before continuing to reconcile
-func (rc *ReconciliationContext) CheckDecommissioningNodes(epData httphelper.CassMetadataEndpoints) result.ReconcileResult {
+func (rc *ReconciliationContext) CheckDecommissioningNodes(epData httphelper.CassMetadataEndpoints, metadataErr error) result.ReconcileResult {
 	rc.ReqLogger.Info("reconcile_racks::CheckDecommissioningNodes")
 	if rc.Datacenter.GetConditionStatus(api.DatacenterScalingDown) != corev1.ConditionTrue {
 		return result.Continue()
@@ -188,6 +191,9 @@ func (rc *ReconciliationContext) CheckDecommissioningNodes(epData httphelper.Cas
 
 	for _, pod := range rc.dcPods {
 		if pod.Labels[api.CassNodeState] == stateDecommissioning {
+			if metadataErr != nil {
+				return result.Error(fmt.Errorf("cannot check decommissioning node %s without Cassandra metadata: %w", pod.Name, metadataErr))
+			}
 			if !IsDoneDecommissioning(pod, epData, nodeStatuses, rc.ReqLogger) {
 				if !HasStartedDecommissioning(pod, epData, nodeStatuses) {
 					rc.ReqLogger.V(1).Info("Decommission has not started trying again", "Pod", pod.Name)

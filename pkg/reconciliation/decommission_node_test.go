@@ -4,6 +4,8 @@
 package reconciliation
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -11,9 +13,12 @@ import (
 	api "github.com/k8ssandra/cass-operator/apis/cassandra/v1beta1"
 	"github.com/k8ssandra/cass-operator/internal/result"
 	"github.com/k8ssandra/cass-operator/pkg/httphelper"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestRetryDecommissionNode(t *testing.T) {
@@ -76,7 +81,7 @@ func TestRetryDecommissionNode(t *testing.T) {
 			},
 		},
 	}
-	r := rc.CheckDecommissioningNodes(epData)
+	r := rc.CheckDecommissioningNodes(epData, nil)
 	if r != result.RequeueSoon(5) {
 		t.Fatalf("expected result of result.RequeueSoon(5) but got %s", r)
 	}
@@ -129,8 +134,122 @@ func TestRemoveResourcesWhenDone(t *testing.T) {
 		},
 	}
 
-	r := rc.CheckDecommissioningNodes(epData)
+	r := rc.CheckDecommissioningNodes(epData, nil)
 	if r != result.RequeueSoon(5) {
 		t.Fatalf("expected result of blah but got %s", r)
 	}
+}
+
+func TestReconcileAllRacksDoesNotCleanUpDecommissioningNodeWhenMetadataRequestFails(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	rc.Datacenter.Spec.Size = 1
+	rc.Datacenter.SetCondition(api.DatacenterCondition{
+		Status: corev1.ConditionTrue,
+		Type:   api.DatacenterScalingDown,
+	})
+
+	server := newFakeMgmtApiServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v0/metadata/endpoints" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	rc.NodeMgmtClient = server.client(rc.ReqLogger)
+
+	statefulSet, err := newStatefulSetForCassandraDatacenter(
+		nil,
+		"default",
+		rc.Datacenter,
+		2,
+		imageRegistry,
+	)
+	require.NoError(t, err)
+	statefulSet.Status.ObservedGeneration = statefulSet.Generation
+
+	podName := getStatefulSetPodNameForIdx(statefulSet, 1)
+	pvcName := fmt.Sprintf("%s-%s", PvcName, podName)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: rc.Datacenter.Namespace,
+			Labels: map[string]string{
+				api.ClusterLabel:    rc.Datacenter.Spec.ClusterName,
+				api.DatacenterLabel: rc.Datacenter.Name,
+				api.CassNodeState:   stateDecommissioning,
+				api.RackLabel:       "default",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "cassandra"}},
+			Volumes: []corev1.Volume{{
+				Name: "server-data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{Name: "cassandra", Ready: true}},
+		},
+	}
+	server.attachToPod(t, pod)
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: rc.Datacenter.Namespace},
+	}
+	remainingPod := pod.DeepCopy()
+	remainingPod.Name = getStatefulSetPodNameForIdx(statefulSet, 0)
+	remainingPod.Labels[api.CassNodeState] = stateStarted
+	remainingPVC := pvc.DeepCopy()
+	remainingPVC.Name = fmt.Sprintf("%s-%s", PvcName, remainingPod.Name)
+	remainingPod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName = remainingPVC.Name
+	rc.Client = fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithStatusSubresource(rc.Datacenter, statefulSet).
+		WithRuntimeObjects(rc.Datacenter, statefulSet, pod, pvc, remainingPod, remainingPVC).
+		WithIndex(&corev1.Pod{}, podPVCClaimNameField, podPVCClaimNames).
+		Build()
+	rc.desiredRackInformation = []*RackInformation{{RackName: "default", NodeCount: 1, SeedCount: 1}}
+	rc.statefulSets = []*appsv1.StatefulSet{statefulSet}
+
+	_, err = rc.ReconcileAllRacks()
+	require.Error(t, err)
+	var requestErr *httphelper.RequestError
+	require.ErrorAs(t, err, &requestErr)
+	require.Equal(t, http.StatusInternalServerError, requestErr.StatusCode)
+	server.assertCallCount(t, "/api/v0/metadata/endpoints", 2)
+	server.assertCallCount(t, "/api/v0/ops/node/decommission", 0)
+
+	storedPVC := &corev1.PersistentVolumeClaim{}
+	require.NoError(t, rc.Client.Get(rc.Ctx, types.NamespacedName{
+		Name: pvcName, Namespace: rc.Datacenter.Namespace,
+	}, storedPVC))
+
+	storedStatefulSet := &appsv1.StatefulSet{}
+	require.NoError(t, rc.Client.Get(rc.Ctx, types.NamespacedName{
+		Name: statefulSet.Name, Namespace: statefulSet.Namespace,
+	}, storedStatefulSet))
+	require.Equal(t, int32(2), *storedStatefulSet.Spec.Replicas)
+}
+
+func TestDecommissionNodesRequiresMetadata(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+
+	rc.Datacenter.Spec.Size = 1
+	two := int32(2)
+	rc.statefulSets = []*appsv1.StatefulSet{{
+		Spec: appsv1.StatefulSetSpec{Replicas: &two},
+	}}
+	metadataErr := errors.New("metadata unavailable")
+
+	reconcileResult := rc.DecommissionNodes(httphelper.CassMetadataEndpoints{}, metadataErr)
+	require.True(t, reconcileResult.Completed())
+	_, err := reconcileResult.Output()
+	require.ErrorIs(t, err, metadataErr)
+	require.NotEqual(t, corev1.ConditionTrue, rc.Datacenter.GetConditionStatus(api.DatacenterScalingDown))
+	require.Equal(t, int32(2), *rc.statefulSets[0].Spec.Replicas)
 }
