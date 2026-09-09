@@ -6,12 +6,15 @@ package reconciliation
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/go-logr/logr/funcr"
 	api "github.com/k8ssandra/cass-operator/apis/cassandra/v1beta1"
 	"github.com/k8ssandra/cass-operator/internal/result"
 	"github.com/k8ssandra/cass-operator/pkg/httphelper"
+	"github.com/k8ssandra/cass-operator/pkg/monitoring"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +22,87 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestRemoveDecommissionedPodFromZeroReplicaSts(t *testing.T) {
+	rc, _, cleanupMockScr := setupTest()
+	defer cleanupMockScr()
+	require := require.New(t)
+
+	var logs []string
+	rc.ReqLogger = funcr.NewJSON(func(log string) {
+		logs = append(logs, log)
+	}, funcr.Options{})
+
+	replicas := int32(0)
+	rc.statefulSets = []*appsv1.StatefulSet{{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-dc2-default-sts",
+			Labels: map[string]string{
+				api.RackLabel: "default",
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+		},
+	}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-dc2-default-sts-0",
+			Namespace: "remove-dc",
+			Labels: map[string]string{
+				api.ClusterLabel:    "test",
+				api.DatacenterLabel: "dc2",
+				api.RackLabel:       "default",
+			},
+		},
+	}
+	defer monitoring.RemovePodStatusMetric(pod)
+
+	statuses := []monitoring.PodStatus{
+		monitoring.PodStatusInitializing,
+		monitoring.PodStatusReady,
+		monitoring.PodStatusPending,
+		monitoring.PodStatusError,
+		monitoring.PodStatusDecommissioning,
+		monitoring.PodStatusTerminating,
+	}
+	for _, status := range statuses {
+		status := strings.ToLower(string(status))
+		monitoring.PodStatusVec.WithLabelValues(
+			pod.Namespace,
+			pod.Labels[api.ClusterLabel],
+			pod.Labels[api.DatacenterLabel],
+			pod.Labels[api.RackLabel],
+			pod.Name,
+			status,
+		).Set(1)
+		_, err := monitoring.GetMetricValue("cass_operator_datacenter_pods_status", map[string]string{
+			"namespace":  pod.Namespace,
+			"cluster":    pod.Labels[api.ClusterLabel],
+			"datacenter": pod.Labels[api.DatacenterLabel],
+			"rack":       pod.Labels[api.RackLabel],
+			"pod":        pod.Name,
+			"status":     status,
+		})
+		require.NoError(err, "expected %s pod status metric to be registered", status)
+	}
+
+	require.NoError(rc.RemoveDecommissionedPodFromSts(pod), "expected an already scaled-down StatefulSet to be a no-op")
+	require.NotContains(strings.Join(logs, "\n"), "sts--1", "expected cleanup not to look for a negative pod ordinal")
+	require.Equal(int32(0), *rc.statefulSets[0].Spec.Replicas, "expected replicas to remain at zero")
+	for _, status := range statuses {
+		status := strings.ToLower(string(status))
+		_, err := monitoring.GetMetricValue("cass_operator_datacenter_pods_status", map[string]string{
+			"namespace":  pod.Namespace,
+			"cluster":    pod.Labels[api.ClusterLabel],
+			"datacenter": pod.Labels[api.DatacenterLabel],
+			"rack":       pod.Labels[api.RackLabel],
+			"pod":        pod.Name,
+			"status":     status,
+		})
+		require.Error(err, "expected %s pod status metric to be removed", status)
+	}
+}
 
 func TestRetryDecommissionNode(t *testing.T) {
 	rc, _, cleanupMockScr := setupTest()
