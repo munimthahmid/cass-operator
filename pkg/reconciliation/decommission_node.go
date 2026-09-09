@@ -341,6 +341,11 @@ func (rc *ReconciliationContext) RemoveDecommissionedPodFromSts(pod *corev1.Pod)
 	}
 
 	maxReplicas := *sts.Spec.Replicas
+	if maxReplicas == 0 {
+		monitoring.RemovePodStatusMetric(pod)
+		return nil
+	}
+
 	lastPodSuffix := stsLastPodSuffix(maxReplicas)
 	if strings.HasSuffix(pod.Name, lastPodSuffix) {
 		monitoring.RemovePodStatusMetric(pod)
