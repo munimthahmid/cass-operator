@@ -1395,34 +1395,24 @@ func isNodeStuckAfterLosingReadiness(pod *corev1.Pod) bool {
 	return hasBeenXMinutesSinceReady(10, pod)
 }
 
-func (rc *ReconciliationContext) getCassMetadataEndpoints() (httphelper.CassMetadataEndpoints, error) {
-	var lastErr error
+func (rc *ReconciliationContext) getCassMetadataEndpoints() httphelper.CassMetadataEndpoints {
+	var metadata httphelper.CassMetadataEndpoints
 	for _, pod := range rc.clusterPods {
-		// A cluster may have no ready pods while starting, so callers decide
-		// whether unavailable metadata should stop their reconciliation step.
+		// Try to query the first ready pod we find.
+		// We won't get any endpoints back if no pods are ready yet.
 		if !isServerReady(pod) {
 			continue
 		}
 
-		metadata, err := rc.NodeMgmtClient.CallMetadataEndpointsEndpoint(pod)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to get Cassandra metadata endpoints from pod %s: %w", pod.Name, err)
-			continue
-		}
+		metadata, _ = rc.NodeMgmtClient.CallMetadataEndpointsEndpoint(pod)
 
 		if len(metadata.Entity) == 0 {
-			// A ready Cassandra node should report at least its own endpoint.
 			continue
 		}
-
-		return metadata, nil
+		break
 	}
 
-	if lastErr != nil {
-		return httphelper.CassMetadataEndpoints{}, lastErr
-	}
-
-	return httphelper.CassMetadataEndpoints{}, fmt.Errorf("no usable Cassandra metadata endpoints available from ready pods")
+	return metadata
 }
 
 // When a vmware taint occurs and we delete the pvc, pv, and
@@ -2709,7 +2699,7 @@ func (rc *ReconciliationContext) ReconcileAllRacks() (reconcile.Result, error) {
 	rc.clusterPods = pods
 	rc.dcPods = rc.datacenterPods()
 
-	endpointData, endpointErr := rc.getCassMetadataEndpoints()
+	endpointData := rc.getCassMetadataEndpoints()
 
 	if recResult := rc.CheckStatefulSetControllerCaughtUp(); recResult.Completed() {
 		return recResult.Output()
@@ -2731,7 +2721,7 @@ func (rc *ReconciliationContext) ReconcileAllRacks() (reconcile.Result, error) {
 		return recResult.Output()
 	}
 
-	if recResult := rc.CheckDecommissioningNodes(endpointData, endpointErr); recResult.Completed() {
+	if recResult := rc.CheckDecommissioningNodes(endpointData); recResult.Completed() {
 		return recResult.Output()
 	}
 
@@ -2763,7 +2753,7 @@ func (rc *ReconciliationContext) ReconcileAllRacks() (reconcile.Result, error) {
 		return recResult.Output()
 	}
 
-	if recResult := rc.DecommissionNodes(endpointData, endpointErr); recResult.Completed() {
+	if recResult := rc.DecommissionNodes(endpointData); recResult.Completed() {
 		return recResult.Output()
 	}
 

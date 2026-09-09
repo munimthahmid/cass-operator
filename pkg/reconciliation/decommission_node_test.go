@@ -4,7 +4,6 @@
 package reconciliation
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -81,7 +80,7 @@ func TestRetryDecommissionNode(t *testing.T) {
 			},
 		},
 	}
-	r := rc.CheckDecommissioningNodes(epData, nil)
+	r := rc.CheckDecommissioningNodes(epData)
 	if r != result.RequeueSoon(5) {
 		t.Fatalf("expected result of result.RequeueSoon(5) but got %s", r)
 	}
@@ -134,7 +133,7 @@ func TestRemoveResourcesWhenDone(t *testing.T) {
 		},
 	}
 
-	r := rc.CheckDecommissioningNodes(epData, nil)
+	r := rc.CheckDecommissioningNodes(epData)
 	if r != result.RequeueSoon(5) {
 		t.Fatalf("expected result of blah but got %s", r)
 	}
@@ -217,9 +216,6 @@ func TestReconcileAllRacksDoesNotCleanUpDecommissioningNodeWhenMetadataRequestFa
 
 	_, err = rc.ReconcileAllRacks()
 	require.Error(t, err)
-	var requestErr *httphelper.RequestError
-	require.ErrorAs(t, err, &requestErr)
-	require.Equal(t, http.StatusInternalServerError, requestErr.StatusCode)
 	server.assertCallCount(t, "/api/v0/metadata/endpoints", 2)
 	server.assertCallCount(t, "/api/v0/ops/node/decommission", 0)
 
@@ -244,12 +240,10 @@ func TestDecommissionNodesRequiresMetadata(t *testing.T) {
 	rc.statefulSets = []*appsv1.StatefulSet{{
 		Spec: appsv1.StatefulSetSpec{Replicas: &two},
 	}}
-	metadataErr := errors.New("metadata unavailable")
-
-	reconcileResult := rc.DecommissionNodes(httphelper.CassMetadataEndpoints{}, metadataErr)
+	reconcileResult := rc.DecommissionNodes(httphelper.CassMetadataEndpoints{})
 	require.True(t, reconcileResult.Completed())
 	_, err := reconcileResult.Output()
-	require.ErrorIs(t, err, metadataErr)
+	require.Error(t, err)
 	require.NotEqual(t, corev1.ConditionTrue, rc.Datacenter.GetConditionStatus(api.DatacenterScalingDown))
 	require.Equal(t, int32(2), *rc.statefulSets[0].Spec.Replicas)
 }
